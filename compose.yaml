@@ -1,0 +1,8 @@
+services:
+  finom-webhook:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
