@@ -114,8 +114,18 @@ def plan(resource, account_id, fee_account_id):
              "currency_code": "EUR",
              "tags": [MARKER], "order": 1,
              "notes": f"Fee included in imported total EUR {total}; net EUR {net}."}
-    return {"apply_rules": False, "fire_webhooks": False,
-            "transactions": [original, extra]}, "ready"
+    group_title = (
+        resource["attributes"].get("group_title")
+        or row.get("description")
+        or "Finom withdrawal"
+    )
+
+    return {
+        "group_title": group_title,
+        "apply_rules": False,
+        "fire_webhooks": False,
+        "transactions": [original, extra],
+    }, "ready"
 
 
 def process(transaction_id):
