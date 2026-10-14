@@ -30,8 +30,24 @@ def api(method, transaction_id, payload=None):
         headers={"Authorization": "Bearer " + os.environ["FIREFLY_TOKEN"],
                  "Accept": "application/json", "Content-Type": "application/json"},
     )
-    with build_opener(NoRedirect).open(req, timeout=15) as response:
-        return json.load(response)
+    #with build_opener(NoRedirect).open(req, timeout=15) as response:
+    #    return json.load(response)
+    try:
+        with build_opener(NoRedirect).open(req, timeout=15) as response:
+            return json.load(response)
+    except HTTPError as exc:
+        body = exc.read(4000).decode("utf-8", errors="replace")
+        LOG.error(
+            "Firefly API method=%s transaction=%s status=%s "
+            "server=%s content_type=%s response=%s",
+            method,
+            transaction_id,
+            exc.code,
+            exc.headers.get("Server"),
+            exc.headers.get("Content-Type"),
+            body,
+        )
+        raise
 
 
 def valid_signature(raw, signature, secret, now=None):
