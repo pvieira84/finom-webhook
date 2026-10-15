@@ -103,16 +103,17 @@ def plan(resource, account_id, fee_account_id):
         return None, "fee rounds to zero"
     if (net * Decimal("0.015")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) != fee:
         return None, "total does not match rounded 1.5% fee"
+    tags = list(dict.fromkeys([*(row.get("tags") or []), "todo", MARKER]))
     # Existing journal: only change amount, order and tags. Omitted metadata
     # stays on the existing journal rather than being copied onto the fee.
     original = {"transaction_journal_id": row["transaction_journal_id"],
                 "amount": str(net), "order": 0,
-                "tags": list(row.get("tags") or []) + [MARKER]}
+                "tags": tags}
     extra = {"type": "withdrawal", "date": row["date"],
              "amount": str(fee), "description": "Fee",
              "source_id": account_id, "destination_id": fee_account_id,
              "currency_code": "EUR",
-             "tags": [MARKER], "order": 1,
+             "tags": tags, "order": 1,
              "notes": f"Fee included in imported total EUR {total}; net EUR {net}."}
     group_title = (
         resource["attributes"].get("group_title")
