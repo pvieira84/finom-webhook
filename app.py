@@ -84,6 +84,7 @@ def plan(resource, account_id, fee_account_id):
     row = rows[0]
     if row["type"] != "withdrawal" or str(row["source_id"]) != account_id:
         return None, "not a Finom withdrawal"
+    prefix = os.environ.get("DESCRIPTION_PREFIX", "CRV*").strip()
     description = (row.get("description") or "").strip()
     if not description.casefold().startswith(prefix.casefold()):
         return None, "description prefix does not match"
