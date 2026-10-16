@@ -131,6 +131,10 @@ def dry_run():
     return os.environ.get("DRY_RUN", "true").lower() != "false"
 
 
+def split_on_timeout():
+    return os.environ.get("SPLIT_ON_TIMEOUT", "false").strip().lower() == "true"
+
+
 def positive_seconds(name, default):
     value = float(os.environ.get(name, default))
     if not 0 < value < float("inf"):
@@ -205,6 +209,11 @@ def handle_job(job):
     if dry_run():
         finish(tid, "cancelled", "DRY_RUN enabled; no update")
         return
+
+    if time.time() >= job["deadline"] and not split_on_timeout():
+        finish(tid, "expired", "AI wait deadline reached")
+        return
+
     try:
         current = api("GET", tid)["data"]
         payload, reason = plan(current, os.environ["FINOM_ACCOUNT_ID"],
@@ -212,23 +221,38 @@ def handle_job(job):
         if payload is None:
             finish(tid, "discarded", reason)
             return
-        if time.time() >= job["deadline"]:
+
+        timed_out = time.time() >= job["deadline"]
+
+        if timed_out and not split_on_timeout():
             finish(tid, "expired", "deadline reached during fetch")
             return
-        if not has_ai_tag(current):
-            LOG.info("transaction=%s waiting_for_ai seconds_left=%.0f", tid,
-                     job["deadline"] - time.time())
+
+        ai_ready = has_ai_tag(current)
+
+        if not ai_ready and not timed_out:
+            LOG.info(
+                "transaction=%s waiting_for_ai seconds_left=%.0f",
+                tid,
+                job["deadline"] - time.time(),
+            )
             return
+
         # Payload is built from this fetch, not the original webhook snapshot.
         api("PUT", tid, payload)
         finish(tid, "completed", "split after AI tag")
     except HTTPError as exc:
         if exc.code == 404:
             finish(tid, "discarded", "transaction no longer exists")
+        elif time.time() >= job["deadline"]:
+            finish(tid, "failed", f"API HTTP {exc.code} at timeout")
         else:
             LOG.error("transaction=%s API HTTP %s; retry before deadline", tid, exc.code)
     except Exception as exc:
-        LOG.error("transaction=%s worker failure=%s; retry before deadline", tid, type(exc).__name__)
+        if time.time() >= job["deadline"]:
+            finish(tid, "failed", f"{type(exc).__name__} at timeout")
+        else:
+            LOG.error("transaction=%s worker failure=%s; retry before deadline",tid, type(exc).__name__,)
 
 
 def worker_tick():
