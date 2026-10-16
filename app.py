@@ -117,7 +117,7 @@ def plan(resource, account_id, fee_account_id):
              "source_id": account_id, "destination_id": fee_account_id,
              "currency_code": "EUR",
              "tags": tags, "order": 1,
-             "notes": f"Fee included in imported total EUR {total}; net EUR {net}."}
+             "notes": f"Fee included in imported total EUR {total:.2f}; net EUR {net:.2f}."}
     group_title = (resource["attributes"].get("group_title")
                    or row.get("description") or "Finom withdrawal")
     return {
