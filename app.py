@@ -203,9 +203,7 @@ def has_ai_tag(resource):
 
 def handle_job(job):
     tid = job["transaction_id"]
-    if time.time() >= job["deadline"]:
-        finish(tid, "expired", "AI wait deadline reached; removed from pending queue")
-        return
+
     if dry_run():
         finish(tid, "cancelled", "DRY_RUN enabled; no update")
         return
@@ -240,7 +238,7 @@ def handle_job(job):
 
         # Payload is built from this fetch, not the original webhook snapshot.
         api("PUT", tid, payload)
-        finish(tid, "completed", "split after AI tag")
+        finish(tid, "completed", "split after AI tag" if ai_ready else "split after timeout")
     except HTTPError as exc:
         if exc.code == 404:
             finish(tid, "discarded", "transaction no longer exists")
