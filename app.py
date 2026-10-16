@@ -5,9 +5,12 @@ import json
 import logging
 import os
 import re
+import signal
+import sqlite3
+from contextlib import contextmanager
 import threading
 import time
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.error import HTTPError
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
@@ -30,23 +33,16 @@ def api(method, transaction_id, payload=None):
         headers={"Authorization": "Bearer " + os.environ["FIREFLY_TOKEN"],
                  "Accept": "application/json", "Content-Type": "application/json"},
     )
-    #with build_opener(NoRedirect).open(req, timeout=15) as response:
-    #    return json.load(response)
     try:
         with build_opener(NoRedirect).open(req, timeout=15) as response:
             return json.load(response)
     except HTTPError as exc:
         body = exc.read(4000).decode("utf-8", errors="replace")
-        LOG.error(
-            "Firefly API method=%s transaction=%s status=%s "
-            "server=%s content_type=%s response=%s",
-            method,
-            transaction_id,
-            exc.code,
-            exc.headers.get("Server"),
-            exc.headers.get("Content-Type"),
-            body,
-        )
+        LOG.error("Firefly API method=%s transaction=%s status=%s server=%s content_type=%s",
+                  method, transaction_id, exc.code, exc.headers.get("Server"),
+                  exc.headers.get("Content-Type"))
+        if os.environ.get("LOG_API_ERROR_BODY", "false").lower() == "true":
+            LOG.error("Firefly response=%s", body)
         raise
 
 
@@ -94,7 +90,10 @@ def plan(resource, account_id, fee_account_id):
         return None, "unsupported currency"
     if row.get("reconciled"):
         return None, "reconciled"
+    try:
     total = Decimal(row["amount"])
+    except (InvalidOperation, TypeError):
+        return None, "unsupported amount"
     if not total.is_finite() or total <= 0 or total != total.quantize(Decimal("0.01")):
         return None, "unsupported amount"
     net = (total / Decimal("1.015")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -115,12 +114,8 @@ def plan(resource, account_id, fee_account_id):
              "currency_code": "EUR",
              "tags": tags, "order": 1,
              "notes": f"Fee included in imported total EUR {total}; net EUR {net}."}
-    group_title = (
-        resource["attributes"].get("group_title")
-        or row.get("description")
-        or "Finom withdrawal"
-    )
-
+    group_title = (resource["attributes"].get("group_title")
+                   or row.get("description") or "Finom withdrawal")
     return {
         "group_title": group_title,
         "apply_rules": False,
@@ -128,21 +123,137 @@ def plan(resource, account_id, fee_account_id):
         "transactions": [original, extra],
     }, "ready"
 
+def dry_run():
+    return os.environ.get("DRY_RUN", "true").lower() != "false"
+
+
+def positive_seconds(name, default):
+    value = float(os.environ.get(name, default))
+    if not 0 < value < float("inf"):
+        raise ValueError(f"{name} must be a positive number")
+    return value
+
+
+@contextmanager
+def database():
+    connection = sqlite3.connect(os.environ.get("QUEUE_DB_PATH", "queue.sqlite3"), timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
+def init_database():
+    with database() as db:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("""CREATE TABLE IF NOT EXISTS jobs (
+            transaction_id TEXT PRIMARY KEY,
+            deadline REAL NOT NULL,
+            next_check REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            detail TEXT NOT NULL DEFAULT ''
+        )""")
+
+
+def finish(transaction_id, state, detail):
+    with database() as db:
+        db.execute("UPDATE jobs SET state=?, detail=? WHERE transaction_id=?",
+                   (state, detail, transaction_id))
+    LOG.info("transaction=%s state=%s detail=%s", transaction_id, state, detail)
+
 
 def process(transaction_id):
+    # Validate live state before durable admission. Never PUT in the HTTP handler.
     current = api("GET", transaction_id)["data"]
     payload, reason = plan(current, os.environ["FINOM_ACCOUNT_ID"],
                            os.environ["FEE_EXPENSE_ACCOUNT_ID"])
     if payload is None:
         LOG.info("transaction=%s skipped=%s", transaction_id, reason)
         return "skipped: " + reason
-    if os.environ.get("DRY_RUN", "true").lower() != "false":
+    if dry_run():
         LOG.info("transaction=%s dry_run net=%s fee=%s", transaction_id,
                  payload["transactions"][0]["amount"], payload["transactions"][1]["amount"])
         return "dry-run"
-    api("PUT", transaction_id, payload)
-    LOG.info("transaction=%s split", transaction_id)
-    return "split"
+    now = time.time()
+    deadline = now + positive_seconds("AI_WAIT_SECONDS", "300")
+    with database() as db:
+        # Duplicates cannot extend the original deadline or resurrect expired work.
+        db.execute("INSERT OR IGNORE INTO jobs(transaction_id, deadline, next_check) VALUES(?, ?, ?)",
+                   (transaction_id, deadline, now))
+        job = db.execute("SELECT state FROM jobs WHERE transaction_id=?", (transaction_id,)).fetchone()
+    LOG.info("transaction=%s queue_state=%s", transaction_id, job["state"])
+    return "queued" if job["state"] == "pending" else job["state"]
+
+
+def has_ai_tag(resource):
+    tags = resource["attributes"]["transactions"][0].get("tags") or []
+    prefix = os.environ.get("AI_TAG_PREFIX", "ai:").strip().casefold()
+    return any(str(tag).strip().casefold().startswith(prefix) for tag in tags)
+
+
+def handle_job(job):
+    tid = job["transaction_id"]
+    if time.time() >= job["deadline"]:
+        finish(tid, "expired", "AI wait deadline reached; removed from pending queue")
+        return
+    if dry_run():
+        finish(tid, "cancelled", "DRY_RUN enabled; no update")
+        return
+    try:
+        current = api("GET", tid)["data"]
+        payload, reason = plan(current, os.environ["FINOM_ACCOUNT_ID"],
+                               os.environ["FEE_EXPENSE_ACCOUNT_ID"])
+        if payload is None:
+            finish(tid, "discarded", reason)
+            return
+        if time.time() >= job["deadline"]:
+            finish(tid, "expired", "deadline reached during fetch")
+            return
+        if not has_ai_tag(current):
+            LOG.info("transaction=%s waiting_for_ai seconds_left=%.0f", tid,
+                     job["deadline"] - time.time())
+            return
+        # Payload is built from this fetch, not the original webhook snapshot.
+        api("PUT", tid, payload)
+        finish(tid, "completed", "split after AI tag")
+    except HTTPError as exc:
+        if exc.code == 404:
+            finish(tid, "discarded", "transaction no longer exists")
+        else:
+            LOG.error("transaction=%s API HTTP %s; retry before deadline", tid, exc.code)
+    except Exception as exc:
+        LOG.error("transaction=%s worker failure=%s; retry before deadline", tid, type(exc).__name__)
+
+
+def worker_tick():
+    now = time.time()
+    interval = positive_seconds("QUEUE_POLL_SECONDS", "5")
+    with database() as db:
+        # Expire all overdue work, including jobs behind a slow API request.
+        expired = db.execute("SELECT transaction_id FROM jobs WHERE state='pending' AND deadline<=?",
+                             (now,)).fetchall()
+        db.execute("UPDATE jobs SET state='expired', detail='AI wait deadline reached' "
+                   "WHERE state='pending' AND deadline<=?", (now,))
+        due = db.execute("SELECT * FROM jobs WHERE state='pending' AND next_check<=? "
+                         "ORDER BY next_check LIMIT 50", (now,)).fetchall()
+    for row in expired:
+        LOG.info("transaction=%s state=expired removed_from_pending_queue", row["transaction_id"])
+    for job in due:
+        handle_job(job)
+        with database() as db:
+            db.execute("UPDATE jobs SET next_check=? WHERE transaction_id=? AND state='pending'",
+                       (time.time() + interval, job["transaction_id"]))
+
+
+def worker_loop(stop):
+    while not stop.is_set():
+        try:
+            worker_tick()
+        except Exception as exc:
+            LOG.error("queue worker failure=%s", type(exc).__name__)
+        stop.wait(0.5)
 
 
 def application(environ, start_response):
@@ -167,8 +278,7 @@ def application(environ, start_response):
     except (ValueError, KeyError, TypeError):
         return reply("400 Bad Request", "expected TRANSACTIONS webhook payload")
     try:
-        # One worker per deployment. Serialize duplicate deliveries and refetch
-        # current state under the lock before modifying anything.
+        # Return after validation and durable enqueue, without waiting for AI.
         with LOCK:
             results = {tid: process(tid) for tid in ids}
         return reply("200 OK", results)
@@ -181,13 +291,33 @@ def application(environ, start_response):
         return reply("503 Service Unavailable", "processing failed")
 
 
-if __name__ == "__main__":
+def main():
     from wsgiref.simple_server import make_server
     logging.basicConfig(level=logging.INFO)
     for key in ("FIREFLY_URL", "FIREFLY_TOKEN", "FINOM_ACCOUNT_ID",
                 "FEE_EXPENSE_ACCOUNT_ID", "WEBHOOK_SECRET", "PORT"):
         if not os.environ.get(key):
             raise SystemExit(f"Missing {key}")
-    port = int(os.environ.get("PORT"))
-    with make_server("0.0.0.0", port, application) as server:
+    positive_seconds("AI_WAIT_SECONDS", "300")
+    positive_seconds("QUEUE_POLL_SECONDS", "5")
+    if not os.environ.get("AI_TAG_PREFIX", "ai:").strip():
+        raise SystemExit("AI_TAG_PREFIX must not be empty")
+    init_database()
+    stop = threading.Event()
+    worker = threading.Thread(target=worker_loop, args=(stop,), name="queue-worker", daemon=True)
+    def terminate(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
+    with make_server("0.0.0.0", int(os.environ["PORT"]), application) as server:
+        worker.start()
+        try:
         server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+            worker.join(timeout=20)
+
+
+if __name__ == "__main__":
+    main()
