@@ -91,7 +91,7 @@ def plan(resource, account_id, fee_account_id):
     if row.get("reconciled"):
         return None, "reconciled"
     try:
-    total = Decimal(row["amount"])
+        total = Decimal(row["amount"])
     except (InvalidOperation, TypeError):
         return None, "unsupported amount"
     if not total.is_finite() or total <= 0 or total != total.quantize(Decimal("0.01")):
@@ -311,7 +311,7 @@ def main():
     with make_server("0.0.0.0", int(os.environ["PORT"]), application) as server:
         worker.start()
         try:
-        server.serve_forever()
+            server.serve_forever()
         except KeyboardInterrupt:
             pass
         finally:
