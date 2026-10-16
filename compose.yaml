@@ -1,8 +1,14 @@
 services:
   finom-webhook:
     build: .
+    container_name: firefly-finom-webhook
     env_file: .env
     restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      - finom-queue:/data
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
+    stop_grace_period: 25s
