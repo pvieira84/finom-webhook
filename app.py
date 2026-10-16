@@ -84,6 +84,9 @@ def plan(resource, account_id, fee_account_id):
     row = rows[0]
     if row["type"] != "withdrawal" or str(row["source_id"]) != account_id:
         return None, "not a Finom withdrawal"
+    description = (row.get("description") or "").strip()
+    if not description.casefold().startswith(prefix.casefold()):
+        return None, "description prefix does not match"
     if MARKER in (row.get("tags") or []):
         return None, "already processed"
     if row.get("currency_code") != "EUR" or row.get("foreign_currency_id") or row.get("foreign_currency_code"):
@@ -302,6 +305,8 @@ def main():
     positive_seconds("QUEUE_POLL_SECONDS", "5")
     if not os.environ.get("AI_TAG_PREFIX", "ai:").strip():
         raise SystemExit("AI_TAG_PREFIX must not be empty")
+    if not os.environ.get("DESCRIPTION_PREFIX", "CRV*").strip():
+        raise SystemExit("DESCRIPTION_PREFIX must not be empty")
     init_database()
     stop = threading.Event()
     worker = threading.Thread(target=worker_loop, args=(stop,), name="queue-worker", daemon=True)
