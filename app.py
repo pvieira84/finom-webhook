@@ -258,16 +258,11 @@ def handle_job(job):
 def worker_tick():
     now = time.time()
     interval = positive_seconds("QUEUE_POLL_SECONDS", "5")
+
     with database() as db:
-        # Expire all overdue work, including jobs behind a slow API request.
-        expired = db.execute("SELECT transaction_id FROM jobs WHERE state='pending' AND deadline<=?",
-                             (now,)).fetchall()
-        db.execute("UPDATE jobs SET state='expired', detail='AI wait deadline reached' "
-                   "WHERE state='pending' AND deadline<=?", (now,))
-        due = db.execute("SELECT * FROM jobs WHERE state='pending' AND next_check<=? "
-                         "ORDER BY next_check LIMIT 50", (now,)).fetchall()
-    for row in expired:
-        LOG.info("transaction=%s state=expired removed_from_pending_queue", row["transaction_id"])
+        due = db.execute("SELECT * FROM jobs WHERE state = 'pending' AND (next_check <= ? OR deadline <= ?) "
+            "ORDER BY next_check LIMIT 50",(now, now),).fetchall()
+
     for job in due:
         handle_job(job)
         with database() as db:
