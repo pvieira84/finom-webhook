@@ -124,7 +124,7 @@ def plan(resource, account_id, fee_account_id):
         "group_title": group_title,
         "apply_rules": False,
         "fire_webhooks": False,
-        "transactions": [original, extra],
+        "transactions": [extra, original],
     }, "ready"
 
 def dry_run():
