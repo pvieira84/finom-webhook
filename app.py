@@ -46,6 +46,36 @@ def api(method, transaction_id, payload=None):
         raise
 
 
+def check_api_auth():
+    base = os.environ["FIREFLY_URL"].rstrip("/")
+    request = Request(
+        f"{base}/api/v1/about",
+        headers={
+            "Authorization": "Bearer " + os.environ["FIREFLY_TOKEN"],
+            "Accept": "application/json",
+        },
+    )
+    with build_opener(NoRedirect).open(request, timeout=15) as response:
+        json.load(response)
+
+
+def get_transaction_or_none(transaction_id):
+    try:
+        return api("GET", transaction_id)["data"]
+    except HTTPError as exc:
+        if exc.code == 404:
+            reason = "deleted or unavailable"
+        elif exc.code == 401:
+            # If authentication fails globally, propagate the error.
+            check_api_auth()
+            reason = "inaccessible; API authentication verified"
+        else:
+            raise
+
+        LOG.warning("transaction=%s skipped=%s", transaction_id, reason)
+        return None
+        
+
 def valid_signature(raw, signature, secret, now=None):
     try:
         parts = dict(part.strip().split("=", 1) for part in signature.split(","))
@@ -174,7 +204,9 @@ def finish(transaction_id, state, detail):
 
 def process(transaction_id):
     # Validate live state before durable admission. Never PUT in the HTTP handler.
-    current = api("GET", transaction_id)["data"]
+    current = get_transaction_or_none(transaction_id)
+    if current is None:
+        return "skipped: deleted or inaccessible"
     payload, reason = plan(current, os.environ["FINOM_ACCOUNT_ID"],
                            os.environ["FEE_EXPENSE_ACCOUNT_ID"])
     if payload is None:
@@ -213,7 +245,10 @@ def handle_job(job):
         return
 
     try:
-        current = api("GET", tid)["data"]
+        current = get_transaction_or_none(tid)
+        if current is None:
+            finish(tid, "discarded", "deleted or inaccessible")
+            return
         payload, reason = plan(current, os.environ["FINOM_ACCOUNT_ID"],
                                os.environ["FEE_EXPENSE_ACCOUNT_ID"])
         if payload is None:
