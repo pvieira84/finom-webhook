@@ -16,7 +16,6 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 LOG = logging.getLogger("finom")
 LOCK = threading.Lock()
-MARKER = "finom-fee-split-v1"
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -118,7 +117,7 @@ def plan(resource, account_id, fee_account_id):
     description = (row.get("description") or "").strip()
     if not description.casefold().startswith(prefix.casefold()):
         return None, "description prefix does not match"
-    if MARKER in (row.get("tags") or []):
+    if "fee included in imported total eur " in (row.get("notes") or "").casefold():
         return None, "already processed"
     if row.get("currency_code") != "EUR" or row.get("foreign_currency_id") or row.get("foreign_currency_code"):
         return None, "unsupported currency"
@@ -136,7 +135,7 @@ def plan(resource, account_id, fee_account_id):
         return None, "fee rounds to zero"
     if (net * Decimal("0.015")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) != fee:
         return None, "total does not match rounded 1.5% fee"
-    tags = list(dict.fromkeys([*(row.get("tags") or []), "todo", MARKER]))
+        tags = list(row.get("tags") or [])
     # Existing journal: only change amount, order and tags. Omitted metadata
     # stays on the existing journal rather than being copied onto the fee.
     original = {"transaction_journal_id": row["transaction_journal_id"],
